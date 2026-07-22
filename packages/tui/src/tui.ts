@@ -22,6 +22,7 @@ import { DEFAULT_MAX_INLINE_IMAGES, ImageBudget } from "./components/image";
 import { planDeccaraFills } from "./deccara";
 import { isKeyRelease, matchesKey } from "./keys";
 import { LoopWatchdog } from "./loop-watchdog";
+import { parseSgrMouse } from "./mouse";
 import { isConPTYHosted, setAltScreenActive, type Terminal } from "./terminal";
 import {
 	encodeKittyDeleteImage,
@@ -104,8 +105,11 @@ export interface RenderScheduler {
 	scheduleRender(callback: () => void, delayMs: number): RenderTimer;
 }
 
+export type TUIRenderBackend = "native-scrollback" | "app-viewport";
+
 export interface TUIOptions {
 	renderScheduler?: RenderScheduler;
+	renderBackend?: TUIRenderBackend;
 }
 
 export interface TUIStartOptions {
@@ -217,6 +221,15 @@ export interface NativeScrollbackCommittedRows {
 }
 
 /**
+ * Marks the end of the root-frame prefix controlled by the app-owned
+ * transcript viewport. Root rows after this boundary stay pinned to the
+ * bottom of the screen while the prefix scrolls.
+ */
+export interface AppViewportScrollRegion {
+	getAppViewportScrollRegionEnd(): number | undefined;
+}
+
+/**
  * A component that discards rows after they enter native scrollback implements
  * this hook so a destructive full replay can rehydrate its complete frame.
  */
@@ -230,6 +243,10 @@ function prepareNativeScrollbackReplay(component: Component): void {
 
 function setNativeScrollbackCommittedRows(component: Component, rows: number): void {
 	(component as Component & Partial<NativeScrollbackCommittedRows>).setNativeScrollbackCommittedRows?.(rows);
+}
+
+function getAppViewportScrollRegionEnd(component: Component): number | undefined {
+	return (component as Component & Partial<AppViewportScrollRegion>).getAppViewportScrollRegionEnd?.();
 }
 
 function isOverlayFocusTarget(owner: Component, component: Component | null): boolean {
@@ -1047,10 +1064,11 @@ export class TUI extends Container {
 	#previousWindow: string[] = [];
 	#nativeScrollbackLiveRegionStart: number | undefined;
 	#nativeScrollbackLiveRegionPinned = false;
+	#appViewportScrollRegionEnd: number | undefined;
 	#fullRedrawCount = 0;
 	// Caps how many inline images render as live graphics; older ones fall back
 	// to text via a purge + full redraw. Cap is configured by the host app.
-	#imageBudget = new ImageBudget(DEFAULT_MAX_INLINE_IMAGES, () => this.requestRender());
+	#imageBudget: ImageBudget;
 	#ghosttyInitialImageDelayDone = false;
 	#ghosttyInitialImageDelayTimer: RenderTimer | undefined;
 	#ghosttyImageReadyAtMs = 0;
@@ -1092,6 +1110,11 @@ export class TUI extends Container {
 	// pushing wrapped fragments into native scrollback.
 	#resizeAltActive = false;
 	#stopped = false;
+	readonly #renderBackend: TUIRenderBackend;
+	#appViewportActive = false;
+	#appViewportFollowTail = true;
+	#appViewportScrollTop = 0;
+	#appViewportPageRows = 1;
 	// Always-on event-loop lag probe. The high default threshold keeps it quiet;
 	// it only logs `ui.loop-blocked` (with the current loop phase) when a frame
 	// budget is genuinely starved. Armed in start(), disarmed in stop().
@@ -1110,6 +1133,9 @@ export class TUI extends Container {
 	// Holds an alternate-screen exit until its replacement full paint can emit it
 	// atomically. It must survive a deferred Ghostty image frame.
 	#pendingAltExit = "";
+	// The primary app-owned viewport and fullscreen overlays share the alternate
+	// buffer frame cache; switching between them naturally invalidates rows that
+	// differ while preserving identical-frame repaint suppression.
 
 	// Persistent composed frame. The render override splices only rows at/after
 	// the stable prefix each frame; cursor markers are stripped at ingestion so
@@ -1164,6 +1190,14 @@ export class TUI extends Container {
 		super();
 		this.terminal = terminal;
 		this.#renderScheduler = options?.renderScheduler ?? DEFAULT_RENDER_SCHEDULER;
+		this.#renderBackend =
+			options?.renderBackend ??
+			(Bun.env.PI_TUI_RENDER_BACKEND === "app-viewport" ? "app-viewport" : "native-scrollback");
+		this.#imageBudget = new ImageBudget(
+			DEFAULT_MAX_INLINE_IMAGES,
+			() => this.requestRender(),
+			this.#renderBackend === "app-viewport",
+		);
 		this.#showHardwareCursor = showHardwareCursor === undefined ? this.#showHardwareCursor : showHardwareCursor;
 		this.#watchdog = new LoopWatchdog();
 	}
@@ -1172,6 +1206,7 @@ export class TUI extends Container {
 		width = Math.max(1, width);
 		this.#nativeScrollbackLiveRegionStart = undefined;
 		this.#nativeScrollbackLiveRegionPinned = false;
+		this.#appViewportScrollRegionEnd = undefined;
 		const children = this.children;
 		const previousSegments = this.#frameSegments;
 		const segments: FrameSegment[] = new Array(children.length);
@@ -1209,7 +1244,8 @@ export class TUI extends Container {
 				// own future rows being pre-committed.
 				const prevRows = previous !== undefined && previous.component === child ? previous.rowCount : 0;
 				const prevStart = previous !== undefined && previous.component === child ? previous.start : offset;
-				setNativeScrollbackCommittedRows(child, Math.min(prevRows, Math.max(0, this.#committedRows - prevStart)));
+				const committedRows = this.#renderBackend === "app-viewport" ? 0 : this.#committedRows;
+				setNativeScrollbackCommittedRows(child, Math.min(prevRows, Math.max(0, committedRows - prevStart)));
 				childLines = child.render(width);
 				const liveRegionStart = getNativeScrollbackLiveRegionStart(child);
 				if (liveRegionStart !== undefined) {
@@ -1239,6 +1275,13 @@ export class TUI extends Container {
 			if (liveLocalStart !== undefined && this.#nativeScrollbackLiveRegionStart === undefined) {
 				this.#nativeScrollbackLiveRegionStart = offset + liveLocalStart;
 				this.#nativeScrollbackLiveRegionPinned = liveRegionPinned;
+			}
+			const appViewportLocalEnd = getAppViewportScrollRegionEnd(child);
+			if (appViewportLocalEnd !== undefined && this.#appViewportScrollRegionEnd === undefined) {
+				const boundedEnd = Number.isFinite(appViewportLocalEnd)
+					? Math.max(0, Math.min(childLines.length, Math.trunc(appViewportLocalEnd)))
+					: childLines.length;
+				this.#appViewportScrollRegionEnd = offset + boundedEnd;
 			}
 			if (chainStable) {
 				if (previous !== undefined && previous.component === child && previous.start === offset) {
@@ -1591,6 +1634,10 @@ export class TUI extends Container {
 				// `#resizeEventPending` is set first so the eventual render still
 				// classifies as a resize.
 				this.#resizeEventPending = true;
+				if (this.#renderBackend === "app-viewport") {
+					this.requestRender(true);
+					return;
+				}
 				if (!resizeRepaintsInPlace()) {
 					// Enter the viewport fast path and (re)arm the settle timer, then
 					// request the cheap viewport-only paint. The authoritative full
@@ -1785,11 +1832,29 @@ export class TUI extends Container {
 		this.#cursorEndSequence = enabled ? CURSOR_END : CURSOR_END_NO_SYNC;
 	}
 
+	#enterAppViewport(): void {
+		if (this.#appViewportActive) return;
+		this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${MOUSE_TRACKING_ON}`);
+		setAltScreenActive(true);
+		this.terminal.hideCursor();
+		this.#forgetHardwareCursorState();
+		this.#recordHardwareCursorHidden();
+		this.#appViewportActive = true;
+		this.#altPreviousLines = [];
+	}
+
 	stop(): void {
 		// Leave the resize alt buffer first so the teardown cursor math below runs
 		// against the restored normal screen (which #previousLines still describes).
 		if (this.#resizeAltActive) {
 			this.terminal.write(this.#leaveResizeAltSequence());
+		}
+		if (this.#appViewportActive) {
+			this.terminal.write(`${MOUSE_TRACKING_OFF}${this.#keyboardEnhancementExit()}\x1b[?1049l`);
+			setAltScreenActive(false);
+			this.#forgetHardwareCursorState();
+			this.#appViewportActive = false;
+			this.#altPreviousLines = [];
 		}
 		if (this.#altActive || this.#pendingAltExit) {
 			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
@@ -1829,7 +1894,7 @@ export class TUI extends Container {
 		// enough; emitting `\r\n` would create an extra blank row. If the content
 		// already reaches the viewport bottom, scroll exactly once so the prompt
 		// lands directly below the last visible TUI row.
-		if (this.#previousFrameLength > 0) {
+		if (this.#renderBackend === "native-scrollback" && this.#previousFrameLength > 0) {
 			const targetRow = this.#previousFrameLength;
 			const viewportBottom = this.#windowTopRow + this.terminal.rows - 1;
 			const clampedCursorRow = Math.max(this.#windowTopRow, Math.min(this.#hardwareCursorRow, viewportBottom));
@@ -2362,6 +2427,40 @@ export class TUI extends Container {
 		this.#lastFrameCostMs = this.#renderScheduler.now() - start;
 	}
 
+	#handleAppViewportInput(data: string): boolean {
+		if (this.#renderBackend !== "app-viewport" || this.#getTopmostVisibleOverlay() !== undefined) return false;
+		if (data.startsWith("\x1b[<")) {
+			const event = parseSgrMouse(data);
+			if (event?.wheel !== null && event?.wheel !== undefined) {
+				this.#appViewportScrollTop = Math.max(0, this.#appViewportScrollTop + event.wheel * 3);
+				this.#appViewportFollowTail = false;
+				this.requestRender(true);
+			}
+			return event !== null;
+		}
+		let delta = 0;
+		if (matchesKey(data, "pageUp") || matchesKey(data, "alt+pageUp")) {
+			delta = -this.#appViewportPageRows;
+		} else if (matchesKey(data, "pageDown") || matchesKey(data, "alt+pageDown")) {
+			delta = this.#appViewportPageRows;
+		} else if (matchesKey(data, "alt+home")) {
+			this.#appViewportScrollTop = 0;
+			this.#appViewportFollowTail = false;
+			this.requestRender(true);
+			return true;
+		} else if (matchesKey(data, "alt+end")) {
+			this.#appViewportFollowTail = true;
+			this.requestRender(true);
+			return true;
+		} else {
+			return false;
+		}
+		this.#appViewportScrollTop = Math.max(0, this.#appViewportScrollTop + delta);
+		this.#appViewportFollowTail = false;
+		this.requestRender(true);
+		return true;
+	}
+
 	#handleInput(data: string): void {
 		// Ctrl+C/Esc use app-level double-press windows. Give those gestures one
 		// frame to drain queued input before an ordinary repaint; delaying every
@@ -2390,6 +2489,7 @@ export class TUI extends Container {
 		if (this.#consumeCellSizeResponse(data)) {
 			return;
 		}
+		if (this.#handleAppViewportInput(data)) return;
 
 		// Global debug key handler (Shift+Ctrl+D)
 		if (matchesKey(data, "shift+ctrl+d") && this.onDebug) {
@@ -2773,6 +2873,16 @@ export class TUI extends Container {
 		const componentScopedOnly = this.#pendingRenderComponentsOnly;
 		this.#pendingRenderComponentsOnly = false;
 
+		if (this.#renderBackend === "app-viewport") {
+			this.#enterAppViewport();
+			if (this.#wantsAltScreen()) {
+				this.#componentRenderTargets.clear();
+				this.#renderAltFrame(width, height);
+			} else {
+				this.#renderAppViewportFrame(width, height, componentScopedOnly);
+			}
+			return;
+		}
 		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
 		// requests it, borrow the terminal's alternate buffer and paint only the
 		// modal there; the normal screen and all accounting stay untouched.
@@ -3842,6 +3952,141 @@ export class TUI extends Container {
 		if (parkUp > 0) buffer += `\x1b[${parkUp}A`;
 		buffer += this.#paintEndSequence;
 		this.terminal.write(buffer);
+	}
+
+	/**
+	 * Compose the full semantic frame, then project its transcript prefix into
+	 * an app-owned viewport while bottom-aligning every row after the transcript
+	 * boundary as sticky interactive chrome.
+	 */
+	#renderAppViewportFrame(width: number, height: number, componentScopedOnly: boolean): void {
+		if (width <= 0 || height <= 0) return;
+		const partialRoots = componentScopedOnly ? this.#resolvePartialComposeRoots(width, height) : null;
+		this.#componentRenderTargets.clear();
+		let rawFrame: readonly string[];
+		if (partialRoots !== null) {
+			this.#partialComposeRoots = partialRoots;
+			try {
+				rawFrame = this.render(width);
+			} finally {
+				this.#partialComposeRoots = null;
+			}
+		} else {
+			this.#imageBudget.beginPass();
+			rawFrame = this.render(width);
+			this.#imageBudget.endPass();
+		}
+		if (this.#maybeDeferGhosttyInitialImagePaint()) return;
+
+		const frame = this.#prepareFrame(rawFrame, width);
+		const scrollEnd = Math.max(0, Math.min(this.#appViewportScrollRegionEnd ?? frame.length, frame.length));
+		const stickyRows = Math.min(Math.max(0, frame.length - scrollEnd), height);
+		const stickyStart = frame.length - stickyRows;
+		const scrollRows = height - stickyRows;
+		const maxScrollTop = Math.max(0, scrollEnd - scrollRows);
+		if (this.#appViewportFollowTail) {
+			this.#appViewportScrollTop = maxScrollTop;
+		} else {
+			this.#appViewportScrollTop = Math.max(0, Math.min(this.#appViewportScrollTop, maxScrollTop));
+			if (this.#appViewportScrollTop === maxScrollTop) this.#appViewportFollowTail = true;
+		}
+		this.#appViewportPageRows = Math.max(1, scrollRows - 1);
+
+		let window: string[] = new Array(height).fill("");
+		for (let row = 0; row < scrollRows; row++) {
+			const sourceRow = this.#appViewportScrollTop + row;
+			if (sourceRow < scrollEnd) window[row] = frame[sourceRow] ?? "";
+		}
+		for (let row = 0; row < stickyRows; row++) {
+			window[scrollRows + row] = frame[stickyStart + row] ?? "";
+		}
+
+		let cursorPos: { row: number; col: number } | null = null;
+		const marker = this.#frameCursorMarkers[this.#frameCursorMarkers.length - 1];
+		if (marker !== undefined) {
+			if (marker.row >= stickyStart) {
+				cursorPos = { row: scrollRows + marker.row - stickyStart, col: marker.col };
+			} else if (
+				marker.row < scrollEnd &&
+				marker.row >= this.#appViewportScrollTop &&
+				marker.row < this.#appViewportScrollTop + scrollRows
+			) {
+				cursorPos = { row: marker.row - this.#appViewportScrollTop, col: marker.col };
+			}
+		}
+
+		if (this.#getTopmostVisibleOverlay() !== undefined) {
+			window = this.#compositeOverlaysIntoWindow(window, width, height);
+			const overlayMarkers = this.#extractCursorMarkers(window);
+			if (overlayMarkers.length > 0) cursorPos = overlayMarkers[0]!;
+			window = this.#prepareLinesArray(window, width);
+		}
+
+		let imageTransmitBuffer = "";
+		for (const sequence of this.#imageBudget.takeTransmits()) imageTransmitBuffer += sequence;
+		let purgeSequence = "";
+		if (TERMINAL.imageProtocol === ImageProtocol.Kitty) {
+			for (const id of this.#imageBudget.takePurgeIds()) purgeSequence += encodeKittyDeleteImage(id);
+		} else {
+			this.#imageBudget.takePurgeIds();
+		}
+		this.#emitAppViewportFrame(window, width, height, cursorPos, imageTransmitBuffer, purgeSequence);
+		this.#clearScrollbackOnNextRender = false;
+		this.#resizeEventPending = false;
+		this.#hasEverRendered = true;
+	}
+
+	/**
+	 * Rewrite the alternate-screen grid without emitting scrollback-affecting
+	 * line feeds or erase-history commands.
+	 */
+	#emitAppViewportFrame(
+		window: string[],
+		width: number,
+		height: number,
+		cursorPos: { row: number; col: number } | null,
+		imageTransmitBuffer: string,
+		purgeSequence: string,
+	): void {
+		if (imageTransmitBuffer.length > 0) this.terminal.write(imageTransmitBuffer);
+		const force = this.#forceViewportRepaintOnNextRender;
+		this.#forceViewportRepaintOnNextRender = false;
+		if (!force && purgeSequence.length === 0 && this.#altPreviousLines.length === height) {
+			let same = true;
+			for (let row = 0; row < height; row++) {
+				if (window[row] !== this.#altPreviousLines[row]) {
+					same = false;
+					break;
+				}
+			}
+			if (same) {
+				this.#writeCursorPosition(cursorPos, height);
+				return;
+			}
+		}
+
+		let buffer = `${this.#paintBeginSequence}\x1b[H${purgeSequence}`;
+		for (let row = 0; row < height; row++) {
+			if (row > 0) buffer += "\r\n";
+			buffer += this.#lineRewriteSequence(window[row] ?? "", width);
+		}
+		const cursorControl = this.#cursorControlSequence(cursorPos, height, Math.max(0, height - 1));
+		buffer += cursorControl.seq;
+		buffer += this.#paintEndSequence;
+		this.terminal.write(buffer);
+		this.#altPreviousLines = window;
+		this.#recordHardwareCursorUpdate(cursorControl);
+		this.#fullRedrawCount += 1;
+	}
+
+	/** Topmost visible overlay requests the alternate-screen buffer. */
+	#wantsAltScreen(): boolean {
+		for (let i = this.overlayStack.length - 1; i >= 0; i--) {
+			const entry = this.overlayStack[i]!;
+			if (!this.#isOverlayVisible(entry)) continue;
+			return entry.options?.fullscreen === true;
+		}
+		return false;
 	}
 
 	/**

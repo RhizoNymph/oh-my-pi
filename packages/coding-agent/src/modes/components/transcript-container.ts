@@ -1,4 +1,5 @@
 import {
+	type AppViewportScrollRegion,
 	type Component,
 	Container,
 	type NativeScrollbackCommittedRows,
@@ -158,7 +159,12 @@ const EMPTY_TAIL: readonly string[] = [];
  */
 export class TranscriptContainer
 	extends Container
-	implements NativeScrollbackLiveRegion, NativeScrollbackCommittedRows, RenderStablePrefix, ViewportTailProvider
+	implements
+		AppViewportScrollRegion,
+		NativeScrollbackLiveRegion,
+		NativeScrollbackCommittedRows,
+		RenderStablePrefix,
+		ViewportTailProvider
 {
 	// Bumped to retire every block segment at once (theme change / clear); a
 	// segment is only reused when its stored generation matches.
@@ -233,6 +239,10 @@ export class TranscriptContainer
 	/** Propagates viewport pinning from the first still-mutating transcript block. */
 	isNativeScrollbackLiveRegionPinned(): boolean {
 		return this.#nativeScrollbackLiveRegionPinned;
+	}
+
+	getAppViewportScrollRegionEnd(): number | undefined {
+		return this.#lines.length;
 	}
 
 	/**
