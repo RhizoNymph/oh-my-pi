@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the experimental `PI_TUI_RENDER_BACKEND=app-viewport` mode, which keeps the status line and editor fixed while mouse-wheel or paging keys scroll earlier transcript rows.
+
 ## [17.0.1] - 2026-07-16
 
 ### Changed

@@ -33,7 +33,17 @@ which implements the commit-boundary seam described below.
 > entirely: **native scrollback is append-only.**
 
 We keep the transcript on the **normal screen** (native scrollback, native
-selection, transcript persists after exit). The engine maintains one ledger:
+selection, transcript persists after exit).
+
+This remains the default backend. Setting
+`PI_TUI_RENDER_BACKEND=app-viewport` selects the experimental fixed-grid
+alternate-screen backend documented in
+[`features/app-viewport-renderer.md`](./features/app-viewport-renderer.md). That
+backend bypasses the native commit ledger entirely: OMP owns the transcript
+offset so rows after the transcript boundary can remain pinned. The native
+contract below is unchanged when the experiment is not selected.
+
+The native engine maintains one ledger:
 
 - **`committedRows` (C)** — frame rows `[0, C)` have been physically scrolled
   into terminal history. They are **immutable**: the engine never rewrites

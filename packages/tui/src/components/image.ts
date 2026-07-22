@@ -63,6 +63,7 @@ function nextImageIdSeed(): number {
 export class ImageBudget {
 	#cap: number;
 	#requestRender: () => void;
+	readonly #forceTextFallback: boolean;
 	#nextId = nextImageIdSeed();
 	#keyToId = new Map<string, number>();
 	#idToKey = new Map<number, string>();
@@ -97,9 +98,14 @@ export class ImageBudget {
 	// full, correctly-ordered walk.
 	#suppressedIds = new Set<number>();
 
-	constructor(cap: number = DEFAULT_MAX_INLINE_IMAGES, requestRender: () => void = () => {}) {
+	constructor(
+		cap: number = DEFAULT_MAX_INLINE_IMAGES,
+		requestRender: () => void = () => {},
+		forceTextFallback = false,
+	) {
 		this.#cap = normalizeCap(cap);
 		this.#requestRender = requestRender;
+		this.#forceTextFallback = forceTextFallback;
 	}
 
 	get cap(): number {
@@ -164,6 +170,10 @@ export class ImageBudget {
 	 * (`#suppressedIds`) keyed by id — order- and partiality-independent.
 	 */
 	observe(imageId: number): boolean {
+		if (this.#forceTextFallback) {
+			this.#forgetKeyForId(imageId);
+			return true;
+		}
 		if (this.#stablePass) {
 			const suppressed = this.#cap > 0 && this.#suppressedIds.has(imageId);
 			if (suppressed) this.#forgetKeyForId(imageId);

@@ -1,4 +1,5 @@
 import {
+	type AppViewportScrollRegion,
 	type Component,
 	Container,
 	type NativeScrollbackCommittedRows,
@@ -162,6 +163,7 @@ const EMPTY_TAIL: readonly string[] = [];
 export class TranscriptContainer
 	extends Container
 	implements
+		AppViewportScrollRegion,
 		NativeScrollbackLiveRegion,
 		NativeScrollbackCommittedRows,
 		NativeScrollbackReplay,
@@ -257,6 +259,10 @@ export class TranscriptContainer
 
 	getNativeScrollbackLiveRegionStart(): number | undefined {
 		return this.#nativeScrollbackLiveRegionStart;
+	}
+
+	getAppViewportScrollRegionEnd(): number | undefined {
+		return this.#lines.length;
 	}
 
 	/**

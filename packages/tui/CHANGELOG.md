@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an experimental `app-viewport` render backend with application-owned transcript scrolling, pinned bottom chrome, fixed-grid alternate-screen painting, and text-safe image fallback.
+
 ## [17.0.1] - 2026-07-16
 
 ### Added
